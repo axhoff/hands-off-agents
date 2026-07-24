@@ -64,7 +64,7 @@ done
 [[ "$(uname -s)" == Linux ]] || die "this installer supports linux only"
 ((EUID != 0)) || die "run this as your normal user, not root"
 
-for command_name in systemctl loginctl journalctl sed install mktemp; do
+for command_name in systemctl loginctl journalctl sed install mktemp date readlink; do
   command -v "${command_name}" >/dev/null 2>&1 ||
     die "required command not found: ${command_name}"
 done
@@ -88,8 +88,11 @@ login_status="$("${codex_bin}" login status 2>&1)" || {
   die "codex login check failed"
 }
 printf '%s\n' "${login_status}"
+# the wording of the status output changes between codex versions, so a
+# mismatch here is a warning, not a failure; a real missing login already
+# made `login status` exit non-zero above
 grep -qi 'logged in using chatgpt' <<<"${login_status}" ||
-  die "remote control requires a chatgpt login; run: codex login --device-auth"
+  warn "could not confirm a chatgpt login from the output above; remote control requires one (codex login --device-auth), continuing anyway"
 
 current_user="$(id -un)"
 linger="$(loginctl show-user "${current_user}" -p Linger --value 2>/dev/null || true)"
@@ -110,6 +113,8 @@ fi
 say "starting remote control once to discover the managed codex binary"
 if ! start_json="$("${codex_bin}" remote-control start --json)"; then
   printf '%s\n' "${start_json:-}" >&2
+  # a failed start can still leave a partial daemon behind; stop it best-effort
+  "${codex_bin}" remote-control stop >/dev/null 2>&1 || true
   die "remote control could not start; stop any competing ssh-launched app-server and retry"
 fi
 temporary_daemon_started=true
@@ -137,8 +142,21 @@ managed_codex_path="$(parse_managed_path "${start_json}")"
   die "codex returned a non-absolute managed path"
 [[ -x "${managed_codex_path}" ]] ||
   die "managed codex binary is not executable: ${managed_codex_path}"
-[[ "${managed_codex_path}" != *$'\n'* && "${managed_codex_path}" != *'"'* ]] ||
+# `%` would be expanded as a systemd specifier inside ExecStart
+[[ "${managed_codex_path}" != *$'\n'* && "${managed_codex_path}" != *'"'* &&
+   "${managed_codex_path}" != *%* ]] ||
   die "managed codex path contains unsupported characters"
+
+# codex may report a version-pinned path; if the stable `current` symlink
+# resolves to the same binary, prefer it so the service survives self-updates
+# that prune old version directories
+stable_codex_path="${HOME}/.codex/packages/standalone/current/bin/codex"
+if [[ "${managed_codex_path}" != "${stable_codex_path}" &&
+      -x "${stable_codex_path}" ]] &&
+   [[ "$(readlink -f "${stable_codex_path}")" == "$(readlink -f "${managed_codex_path}")" ]]; then
+  say "preferring the stable path ${stable_codex_path} over the version-pinned one"
+  managed_codex_path="${stable_codex_path}"
+fi
 
 say "managed codex binary: ${managed_codex_path}"
 say "stopping the temporary daemon"
@@ -149,7 +167,7 @@ mkdir -p -- "${service_dir}"
 
 if [[ -f "${service_file}" ]] &&
    ! grep -q '^# installed by install-codex.sh$' "${service_file}"; then
-  backup_file="${service_file}.backup.$(date -u +%Y%m%dT%H%M%SZ)"
+  backup_file="${service_file}.backup.$(date -u +%Y%m%dT%H%M%SZ).$$"
   cp -- "${service_file}" "${backup_file}"
   warn "backed up the existing service to ${backup_file}"
 fi
@@ -159,8 +177,9 @@ cat >"${unit_tmp}" <<EOF
 # installed by install-codex.sh
 [Unit]
 Description=Codex Remote Control
-Wants=network-online.target
-After=network-online.target
+# the systemd user manager has no functional network-online.target, so there
+# is nothing to order against; Restart=always below covers "started before
+# the network was up"
 
 [Service]
 Type=simple
@@ -179,12 +198,16 @@ rm -f -- "${unit_tmp}"
 unit_tmp=""
 
 say "enabling and starting ${service_name}"
+# the journal keeps lines from previous installs, so only trust log lines
+# written after this start
+service_start_ts="$(date '+%Y-%m-%d %H:%M:%S')"
 systemctl --user daemon-reload
 systemctl --user enable --now "${service_name}"
 
 connected=false
 for _ in {1..30}; do
-  if journalctl --user -u "${service_name}" -n 30 --no-pager 2>/dev/null |
+  if journalctl --user -u "${service_name}" --since "${service_start_ts}" \
+       --no-pager 2>/dev/null |
      grep -q 'available for remote control'; then
     connected=true
     break
@@ -204,7 +227,8 @@ elif systemctl --user is-active --quiet "${service_name}"; then
   warn "the service is active, but relay connection was not confirmed within 30 seconds"
 else
   systemctl --user status "${service_name}" --no-pager || true
-  journalctl --user -u "${service_name}" -n 50 --no-pager || true
+  journalctl --user -u "${service_name}" --since "${service_start_ts}" \
+    -n 50 --no-pager || true
   die "the service did not stay active"
 fi
 
