@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# prepares a linux host for remote sessions from the claude code desktop app.
+#
+# the app connects over ssh, multiplexes several exec channels over a single
+# connection, and deploys its own server binary into the user's home
+# directory. a hardened sshd (MaxSessions too low, ForceCommand set, a
+# restricted authorized_keys entry) or a noisy shell profile breaks this with
+# one generic client-side error:
+#
+#   "couldn't run a command on the remote"
+#
+# this script checks everything the app needs on the host side and fixes what
+# it safely can. every sshd change is backed up, validated with `sshd -t`
+# before reload, and rolled back automatically if anything goes wrong.
+
+min_sessions=10
+mode=fix
+issues=0
+declare -a backups=()
+sshd_edit_in_progress=false
+
+say()   { printf '==> %s\n' "$*"; }
+ok()    { printf '    ok: %s\n' "$*"; }
+warn()  { printf 'warning: %s\n' "$*" >&2; }
+die()   { printf 'error: %s\n' "$*" >&2; exit 1; }
+issue() { printf 'problem: %s\n' "$*" >&2; issues=$((issues + 1)); }
+
+usage() {
+  cat <<'EOF'
+usage: install-claude.sh [--check] [--min-sessions N]
+
+prepares this host for remote ssh sessions from the claude code desktop app.
+
+options:
+  --check           report problems without changing anything
+  --min-sessions N  required sshd MaxSessions value (default: 10)
+  -h, --help        show this help
+
+run this on the remote host as the user the app will connect as, not as root.
+sshd fixes use sudo and may prompt for your password.
+EOF
+}
+
+restore_backups() {
+  local pair file backup
+  for pair in "${backups[@]}"; do
+    file="${pair%%|*}"
+    backup="${pair#*|}"
+    sudo cp -p -- "${backup}" "${file}" &&
+      warn "restored ${file} from ${backup}"
+  done
+}
+
+on_exit() {
+  # roll back half-applied sshd edits if the script dies before validation
+  if [[ "${sshd_edit_in_progress}" == true && ${#backups[@]} -gt 0 ]]; then
+    warn "script interrupted mid-edit; rolling back sshd changes"
+    restore_backups
+  fi
+}
+
+trap on_exit EXIT
+
+while (($#)); do
+  case "$1" in
+    --check)
+      mode=check
+      ;;
+    --min-sessions)
+      shift
+      [[ "${1:-}" =~ ^[0-9]+$ ]] || die "--min-sessions needs a number"
+      min_sessions="$1"
+      ((min_sessions >= 4)) || die "--min-sessions below 4 will not work; the app opens several channels at once"
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+  shift
+done
+
+[[ "$(uname -s)" == Linux ]] || die "this script supports linux only"
+((EUID != 0)) || die "run this as the user the app connects as, not root"
+
+for command_name in grep sed awk install mktemp cp date id df stat; do
+  command -v "${command_name}" >/dev/null 2>&1 ||
+    die "required command not found: ${command_name}"
+done
+
+# ---------------------------------------------------------------- host basics
+
+say "checking the host"
+
+arch="$(uname -m)"
+case "${arch}" in
+  x86_64|aarch64) ok "architecture ${arch} is supported" ;;
+  *) die "unsupported architecture: ${arch} (the app ships linux amd64/arm64 binaries)" ;;
+esac
+
+[[ -w "${HOME}" ]] || die "home directory is not writable: ${HOME}"
+
+if [[ -e "${HOME}/.claude" && ! -w "${HOME}/.claude" ]]; then
+  issue "${HOME}/.claude exists but is not writable by $(id -un); fix its ownership"
+else
+  ok "home directory is writable"
+fi
+
+if command -v findmnt >/dev/null 2>&1; then
+  mount_opts="$(findmnt -no OPTIONS --target "${HOME}" 2>/dev/null || true)"
+  if [[ ",${mount_opts}," == *,noexec,* ]]; then
+    issue "the filesystem holding ${HOME} is mounted noexec; the app cannot run its deployed binary there"
+  else
+    ok "home filesystem allows executing binaries"
+  fi
+fi
+
+avail_kb="$(df -Pk "${HOME}" | awk 'NR==2 {print $4}')"
+if ((avail_kb < 512 * 1024)); then
+  warn "less than 512mb free on the home filesystem; binary deployment or sessions may fail"
+else
+  ok "enough free disk space"
+fi
+
+# ------------------------------------------------------------- shell profile
+
+say "checking the login shell profile"
+
+login_shell="$(getent passwd "$(id -un)" | cut -d: -f7)"
+[[ -n "${login_shell}" ]] || login_shell="${SHELL:-/bin/sh}"
+shell_name="$(basename "${login_shell}")"
+
+probe() {
+  # run a command the way sshd would run a non-interactive remote command;
+  # SSH_CLIENT/SSH_CONNECTION make debian-family bash source ~/.bashrc the
+  # same way it does for a real ssh exec channel
+  SSH_CLIENT='claude-probe 0 22' SSH_CONNECTION='claude-probe 0 0 22' \
+    "${login_shell}" -c "$1" 2>/dev/null
+}
+
+profile_noise="$(probe 'true' || true)"
+if [[ -n "${profile_noise}" ]]; then
+  issue "your shell profile prints to stdout for non-interactive commands; this corrupts the app's protocol. remove echo/banner lines from the top of your shell rc files"
+else
+  ok "non-interactive shells produce no stray output"
+fi
+
+# ------------------------------------------------------------- claude binary
+
+say "checking for claude on the non-interactive path"
+
+# the app deploys its own server binary, so a missing claude is not fatal for
+# connecting -- but sessions and plain `ssh host claude ...` need it resolvable
+claude_dir=""
+for candidate in "${HOME}/.local/bin" "${HOME}/.npm-global/bin" /usr/local/bin; do
+  if [[ -x "${candidate}/claude" ]]; then
+    claude_dir="${candidate}"
+    break
+  fi
+done
+if [[ -z "${claude_dir}" ]] && command -v claude >/dev/null 2>&1; then
+  claude_dir="$(dirname "$(command -v claude)")"
+fi
+
+fix_noninteractive_path() {
+  local rcfile export_line tmp
+  export_line="export PATH=\"${claude_dir}:\$PATH\""
+
+  case "${shell_name}" in
+    bash) rcfile="${HOME}/.bashrc" ;;
+    zsh)  rcfile="${HOME}/.zshenv" ;;
+    *)
+      warn "unsupported login shell ${shell_name}; add ${claude_dir} to PATH for non-interactive shells yourself"
+      return 1
+      ;;
+  esac
+
+  if [[ -f "${rcfile}" ]] && grep -qF "${export_line}" "${rcfile}"; then
+    warn "${rcfile} already exports that path but the probe still fails; inspect ${rcfile} manually"
+    return 1
+  fi
+
+  if [[ -f "${rcfile}" ]]; then
+    cp -p -- "${rcfile}" "${rcfile}.bak-claude-$(date -u +%Y%m%dT%H%M%SZ)"
+  fi
+
+  tmp="$(mktemp)"
+  {
+    printf '# added by install-claude.sh: expose %s to non-interactive ssh commands\n' "${claude_dir}"
+    printf '%s\n\n' "${export_line}"
+    cat -- "${rcfile}" 2>/dev/null || true
+  } >"${tmp}"
+  # prepend, so the line lands above any "if not interactive, return" guard
+  install -m 0644 "${tmp}" "${rcfile}"
+  rm -f -- "${tmp}"
+  say "prepended PATH export to ${rcfile}"
+}
+
+if probe 'command -v claude' >/dev/null; then
+  ok "claude resolves in non-interactive ssh commands"
+elif [[ -z "${claude_dir}" ]]; then
+  warn "claude is not installed; the app can still connect, but install it with: curl -fsSL https://claude.ai/install.sh | bash"
+elif [[ "${mode}" == check ]]; then
+  issue "claude exists at ${claude_dir}/claude but is not on the non-interactive PATH (fixable: rerun without --check)"
+else
+  if fix_noninteractive_path && probe 'command -v claude' >/dev/null; then
+    ok "claude now resolves in non-interactive ssh commands"
+  else
+    issue "could not make claude resolvable non-interactively; add ${claude_dir} to PATH before any interactivity guard in your shell rc"
+  fi
+fi
+
+# --------------------------------------------------------------- sshd checks
+
+say "checking sshd"
+
+sshd_bin="$(command -v sshd || true)"
+for candidate in /usr/sbin/sshd /usr/local/sbin/sshd; do
+  [[ -n "${sshd_bin}" ]] && break
+  [[ -x "${candidate}" ]] && sshd_bin="${candidate}"
+done
+[[ -n "${sshd_bin}" ]] || die "sshd not found; is an openssh server installed?"
+
+have_sudo=false
+if command -v sudo >/dev/null 2>&1; then
+  if sudo -n true 2>/dev/null; then
+    have_sudo=true
+  elif [[ "${mode}" == fix ]] || [[ -t 0 ]]; then
+    say "sudo may prompt for your password"
+    sudo -v && have_sudo=true
+  fi
+fi
+
+if [[ "${have_sudo}" != true ]]; then
+  [[ "${mode}" == check ]] ||
+    die "sshd checks and fixes need sudo; rerun with sudo access or use --check"
+  warn "no sudo available; sshd checks are skipped and this report is incomplete"
+fi
+
+if [[ "${have_sudo}" == true ]]; then
+  if ! sshd_effective="$(sudo "${sshd_bin}" -T 2>/dev/null)"; then
+    sudo "${sshd_bin}" -t || true
+    die "sshd's current configuration does not validate; fix that first"
+  fi
+
+  effective() {
+    awk -v key="$1" '$1 == key { $1 = ""; sub(/^ /, ""); print; exit }' \
+      <<<"${sshd_effective}"
+  }
+
+  force_command="$(effective forcecommand)"
+  if [[ -n "${force_command}" && "${force_command}" != none ]]; then
+    issue "sshd sets ForceCommand '${force_command}'; the app cannot run its server binary. remove it (or scope it to a Match block that excludes this user)"
+  else
+    ok "no ForceCommand configured"
+  fi
+
+  if [[ "$(effective permittty)" == no ]]; then
+    issue "sshd sets PermitTTY no; interactive sessions will not work"
+  else
+    ok "PermitTTY allows terminals"
+  fi
+
+  if [[ "$(effective allowtcpforwarding)" == no ]]; then
+    warn "AllowTcpForwarding is off; not known to block the app today, but flip it on if connections fail after everything else checks out"
+  fi
+
+  max_startups="$(effective maxstartups | cut -d: -f1)"
+  if [[ "${max_startups}" =~ ^[0-9]+$ ]] && ((max_startups < 10)); then
+    warn "MaxStartups start value is ${max_startups}; reconnect storms may get dropped"
+  fi
+
+  current_sessions="$(effective maxsessions)"
+  [[ "${current_sessions}" =~ ^[0-9]+$ ]] ||
+    die "could not read MaxSessions from sshd -T output"
+
+  if ((current_sessions >= min_sessions)); then
+    ok "MaxSessions is ${current_sessions} (needs >= ${min_sessions})"
+  elif [[ "${mode}" == check ]]; then
+    issue "MaxSessions is ${current_sessions}, but the app multiplexes several exec channels over one connection and needs >= ${min_sessions} (fixable: rerun without --check)"
+  else
+    say "raising MaxSessions from ${current_sessions} to ${min_sessions}"
+
+    shopt -s nullglob
+    config_files=(/etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf)
+    shopt -u nullglob
+
+    timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    sshd_edit_in_progress=true
+    changed_any=false
+
+    for config_file in "${config_files[@]}"; do
+      sudo test -f "${config_file}" || continue
+      sudo grep -Eiq '^[[:space:]]*maxsessions[[:space:]]' "${config_file}" ||
+        continue
+
+      backup_file="${config_file}.bak-${timestamp}"
+      sudo cp -p -- "${config_file}" "${backup_file}"
+      backups+=("${config_file}|${backup_file}")
+
+      file_mode="$(sudo stat -c '%a' "${config_file}")"
+      rewrite_tmp="$(mktemp)"
+      # only rewrite the global section; a MaxSessions inside a Match block
+      # is scoped policy this script must not touch
+      sudo cat -- "${config_file}" | awk -v n="${min_sessions}" '
+        { keyword = tolower($1) }
+        keyword == "match" { in_match = 1 }
+        !in_match && keyword == "maxsessions" { print "MaxSessions " n; next }
+        { print }
+      ' >"${rewrite_tmp}"
+      sudo install -m "${file_mode}" -o root -g root "${rewrite_tmp}" "${config_file}"
+      rm -f -- "${rewrite_tmp}"
+      changed_any=true
+      say "updated ${config_file} (backup: ${backup_file})"
+    done
+
+    if [[ "${changed_any}" != true ]]; then
+      # nothing defines it globally, yet the effective value is low: append
+      # to the main config (first-obtained-wins makes drop-in order fragile)
+      backup_file="/etc/ssh/sshd_config.bak-${timestamp}"
+      sudo cp -p -- /etc/ssh/sshd_config "${backup_file}"
+      backups+=("/etc/ssh/sshd_config|${backup_file}")
+      printf '\n# added by install-claude.sh\nMaxSessions %s\n' "${min_sessions}" |
+        sudo tee -a /etc/ssh/sshd_config >/dev/null
+      say "appended MaxSessions ${min_sessions} to /etc/ssh/sshd_config (backup: ${backup_file})"
+    fi
+
+    if ! sudo "${sshd_bin}" -t; then
+      restore_backups
+      sshd_edit_in_progress=false
+      die "the edited sshd configuration failed validation; all changes were rolled back"
+    fi
+
+    # reload keeps existing connections (including this one) alive; restart
+    # is also safe for established sessions, but try the gentle path first
+    if ! sudo systemctl reload ssh 2>/dev/null &&
+       ! sudo systemctl reload sshd 2>/dev/null; then
+      warn "reload failed; restarting sshd (established sessions survive)"
+      sudo systemctl restart ssh 2>/dev/null ||
+        sudo systemctl restart sshd 2>/dev/null || {
+          restore_backups
+          sshd_edit_in_progress=false
+          die "could not reload or restart sshd; changes were rolled back"
+        }
+    fi
+
+    systemctl is-active --quiet ssh 2>/dev/null ||
+      systemctl is-active --quiet sshd 2>/dev/null ||
+      warn "could not confirm the ssh service is active; check it now"
+
+    sshd_effective="$(sudo "${sshd_bin}" -T 2>/dev/null || true)"
+    new_sessions="$(effective maxsessions)"
+    if [[ "${new_sessions}" =~ ^[0-9]+$ ]] && ((new_sessions >= min_sessions)); then
+      sshd_edit_in_progress=false
+      ok "MaxSessions is now ${new_sessions}"
+    else
+      sshd_edit_in_progress=false
+      issue "MaxSessions is still ${new_sessions:-unknown} after the edit; a Match block or include ordering overrides it -- inspect /etc/ssh/sshd_config and /etc/ssh/sshd_config.d/ manually (backups: ${backups[*]})"
+    fi
+  fi
+fi
+
+# ----------------------------------------------------------- authorized_keys
+
+authorized_keys="${HOME}/.ssh/authorized_keys"
+if [[ -f "${authorized_keys}" ]] &&
+   grep -Eq '^[^#]*(^|[ ,])(command=|restrict)' "${authorized_keys}"; then
+  warn "authorized_keys contains command= or restrict options; if the app's key hits one of those lines, it cannot run its server"
+fi
+
+# -------------------------------------------------------------------- summary
+
+printf '\n'
+if ((issues > 0)); then
+  die "${issues} problem(s) need attention (details above)"
+fi
+
+if [[ "${mode}" == check ]]; then
+  say "all checks passed; this host is ready for claude code remote sessions"
+else
+  say "this host is ready; hit \"try again\" in the claude code desktop app"
+  printf '\nif it still fails, read the client-side log on your mac:\n'
+  printf '  tail -40 ~/Library/Logs/Claude/ssh.log\n'
+fi
