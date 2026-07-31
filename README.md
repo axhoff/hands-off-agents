@@ -36,6 +36,8 @@ the installer:
 - checks the platform, systemd, and chatgpt authentication
 - enables user lingering so services start without an ssh login
 - discovers codex's managed standalone binary
+- retries a failed relay enrollment after a clean daemon stop and reports
+  `codex doctor` diagnostics if recovery fails
 - replaces the temporary pid daemon with a systemd user service
 - backs up an existing service file before replacing it
 - enables restart-on-failure and startup after reboot
@@ -49,6 +51,11 @@ systemctl --user status codex-remote-control.service
 systemctl --user restart codex-remote-control.service
 journalctl --user -u codex-remote-control.service -f
 ```
+
+if setup reports an errored connection, the installer now attempts the common
+stop/start recovery three times. persistent failures usually need a refreshed
+chatgpt device login, mfa, workspace remote-control permission, or outbound
+https access—not manual deletion of codex state files.
 
 ## claude
 

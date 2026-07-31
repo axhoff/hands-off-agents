@@ -9,6 +9,9 @@ temporary_daemon_started=false
 unit_tmp=""
 codex_installer_tmp=""
 codex_bin=""
+remote_start_error_tmp=""
+remote_start_error=""
+start_json=""
 
 say() {
   printf '==> %s\n' "$*"
@@ -43,6 +46,11 @@ cleanup() {
 
   if [[ -n "${codex_installer_tmp}" && -e "${codex_installer_tmp}" ]]; then
     rm -f -- "${codex_installer_tmp}"
+  fi
+
+  if [[ -n "${remote_start_error_tmp}" &&
+        -e "${remote_start_error_tmp}" ]]; then
+    rm -f -- "${remote_start_error_tmp}"
   fi
 
   if [[ "${temporary_daemon_started}" == true && -n "${codex_bin}" ]]; then
@@ -92,6 +100,33 @@ install_codex() {
   codex_installer_tmp=""
 }
 
+start_remote_control() {
+  start_json=""
+  remote_start_error=""
+  remote_start_error_tmp="$(mktemp "${TMPDIR:-/tmp}/codex-remote-start.XXXXXX")"
+
+  if start_json="$("${codex_bin}" remote-control start --json \
+      2>"${remote_start_error_tmp}")"; then
+    rm -f -- "${remote_start_error_tmp}"
+    remote_start_error_tmp=""
+    return 0
+  fi
+
+  remote_start_error="$(<"${remote_start_error_tmp}")"
+  rm -f -- "${remote_start_error_tmp}"
+  remote_start_error_tmp=""
+  return 1
+}
+
+show_remote_diagnostics() {
+  printf '\nremote control diagnostics:\n' >&2
+  if "${codex_bin}" doctor --no-color >&2; then
+    return
+  fi
+
+  warn "this codex version could not run 'codex doctor'"
+}
+
 trap cleanup EXIT
 
 while (($#)); do
@@ -113,7 +148,7 @@ done
 [[ "$(uname -s)" == Linux ]] || die "this installer supports linux only"
 ((EUID != 0)) || die "run this as your normal user, not root"
 
-for command_name in systemctl loginctl journalctl sed install mktemp date readlink; do
+for command_name in systemctl loginctl journalctl sed install mktemp date readlink sleep; do
   command -v "${command_name}" >/dev/null 2>&1 ||
     die "required command not found: ${command_name}"
 done
@@ -169,11 +204,30 @@ if systemctl --user is-active --quiet "${service_name}"; then
 fi
 
 say "starting remote control once to discover the managed codex binary"
-if ! start_json="$("${codex_bin}" remote-control start --json)"; then
-  printf '%s\n' "${start_json:-}" >&2
-  # a failed start can still leave a partial daemon behind; stop it best-effort
+remote_started=false
+for attempt in 1 2 3; do
+  if start_remote_control; then
+    remote_started=true
+    break
+  fi
+
+  printf '%s\n' "${remote_start_error:-remote control start failed without an error message}" >&2
+  if ((attempt < 3)); then
+    warn "remote control start attempt ${attempt} failed; stopping stale state before retrying"
+    "${codex_bin}" remote-control stop >/dev/null 2>&1 || true
+    sleep 3
+  fi
+done
+
+if [[ "${remote_started}" != true ]]; then
+  # Leave no half-started daemon or misleading control socket behind.
   "${codex_bin}" remote-control stop >/dev/null 2>&1 || true
-  die "remote control could not start; stop any competing ssh-launched app-server and retry"
+  show_remote_diagnostics
+  printf '\ncommon causes are an expired chatgpt session, missing mfa, disabled\n' >&2
+  printf 'workspace remote-control access, or blocked outbound https. after fixing it:\n' >&2
+  printf '  codex login --device-auth\n' >&2
+  printf '  bash install-codex.sh --pair\n' >&2
+  die "remote control still could not enroll after a clean stop/start recovery"
 fi
 temporary_daemon_started=true
 
