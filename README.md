@@ -15,7 +15,7 @@ blind process killing.
 ### requirements
 
 - linux with systemd user services
-- codex installed and authenticated with a chatgpt account
+- internet access; `curl` or `wget` is needed only when codex is missing
 - `sudo` access if user lingering is not already enabled
 
 ### install
@@ -30,6 +30,9 @@ bash install-codex.sh --pair
 
 the installer:
 
+- installs codex with openai's official standalone installer when it is missing
+- guides chatgpt device login and leaves the browser link and one-time code
+  visible
 - checks the platform, systemd, and chatgpt authentication
 - enables user lingering so services start without an ssh login
 - discovers codex's managed standalone binary

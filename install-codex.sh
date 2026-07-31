@@ -7,6 +7,8 @@ service_file="${service_dir}/${service_name}"
 pair_after_install=false
 temporary_daemon_started=false
 unit_tmp=""
+codex_installer_tmp=""
+codex_bin=""
 
 say() {
   printf '==> %s\n' "$*"
@@ -25,7 +27,8 @@ usage() {
   cat <<'EOF'
 usage: install-codex.sh [--pair]
 
-installs codex remote control as a persistent systemd user service.
+installs codex when missing, then configures remote control as a persistent
+systemd user service.
 
 options:
   --pair  create a short-lived pairing code after installation
@@ -38,9 +41,55 @@ cleanup() {
     rm -f -- "${unit_tmp}"
   fi
 
-  if [[ "${temporary_daemon_started}" == true ]]; then
+  if [[ -n "${codex_installer_tmp}" && -e "${codex_installer_tmp}" ]]; then
+    rm -f -- "${codex_installer_tmp}"
+  fi
+
+  if [[ "${temporary_daemon_started}" == true && -n "${codex_bin}" ]]; then
     "${codex_bin}" remote-control stop >/dev/null 2>&1 || true
   fi
+}
+
+find_codex() {
+  if command -v codex >/dev/null 2>&1; then
+    command -v codex
+  elif [[ -n "${CODEX_INSTALL_DIR:-}" &&
+          -x "${CODEX_INSTALL_DIR}/codex" ]]; then
+    printf '%s\n' "${CODEX_INSTALL_DIR}/codex"
+  elif [[ -x "${HOME}/.local/bin/codex" ]]; then
+    printf '%s\n' "${HOME}/.local/bin/codex"
+  elif [[ -x "${HOME}/.codex/packages/standalone/current/bin/codex" ]]; then
+    printf '%s\n' "${HOME}/.codex/packages/standalone/current/bin/codex"
+  elif [[ -x "${HOME}/.codex/packages/standalone/current/codex" ]]; then
+    printf '%s\n' "${HOME}/.codex/packages/standalone/current/codex"
+  else
+    return 1
+  fi
+}
+
+install_codex() {
+  codex_installer_tmp="$(mktemp "${TMPDIR:-/tmp}/codex-install.XXXXXX")"
+
+  say "downloading the official codex installer"
+  if command -v curl >/dev/null 2>&1; then
+    curl --fail --silent --show-error --location \
+      https://chatgpt.com/codex/install.sh \
+      --output "${codex_installer_tmp}"
+  elif command -v wget >/dev/null 2>&1; then
+    wget --quiet \
+      https://chatgpt.com/codex/install.sh \
+      --output-document="${codex_installer_tmp}"
+  else
+    die "codex is missing and neither curl nor wget is available to download the official installer"
+  fi
+
+  [[ -s "${codex_installer_tmp}" ]] ||
+    die "the downloaded codex installer is empty"
+
+  say "installing codex"
+  sh "${codex_installer_tmp}"
+  rm -f -- "${codex_installer_tmp}"
+  codex_installer_tmp=""
 }
 
 trap cleanup EXIT
@@ -69,30 +118,39 @@ for command_name in systemctl loginctl journalctl sed install mktemp date readli
     die "required command not found: ${command_name}"
 done
 
-if command -v codex >/dev/null 2>&1; then
-  codex_bin="$(command -v codex)"
-elif [[ -x "${HOME}/.local/bin/codex" ]]; then
-  codex_bin="${HOME}/.local/bin/codex"
-elif [[ -x "${HOME}/.codex/packages/standalone/current/codex" ]]; then
-  codex_bin="${HOME}/.codex/packages/standalone/current/codex"
+if codex_bin="$(find_codex)"; then
+  say "found codex at ${codex_bin}"
 else
-  die "codex was not found; install it and make sure it is on PATH"
+  install_codex
+  hash -r
+  codex_bin="$(find_codex)" ||
+    die "the codex installer finished, but the codex executable could not be found"
+  say "installed codex at ${codex_bin}"
 fi
 
 systemctl --user show-environment >/dev/null 2>&1 ||
   die "the systemd user manager is unavailable"
 
 say "checking chatgpt authentication"
-login_status="$("${codex_bin}" login status 2>&1)" || {
-  printf '%s\n' "${login_status}" >&2
-  die "codex login check failed"
-}
-printf '%s\n' "${login_status}"
-# the wording of the status output changes between codex versions, so a
-# mismatch here is a warning, not a failure; a real missing login already
-# made `login status` exit non-zero above
-grep -qi 'logged in using chatgpt' <<<"${login_status}" ||
-  warn "could not confirm a chatgpt login from the output above; remote control requires one (codex login --device-auth), continuing anyway"
+login_status="$("${codex_bin}" login status 2>&1 || true)"
+if grep -qi 'logged in using chatgpt' <<<"${login_status}"; then
+  printf '%s\n' "${login_status}"
+else
+  [[ -t 0 && -t 1 ]] || {
+    printf '%s\n' "${login_status}" >&2
+    die "chatgpt login is required; rerun from an interactive terminal so codex can display the one-time device code"
+  }
+
+  warn "remote control requires a chatgpt login"
+  printf 'codex will display a browser link and one-time code below.\n'
+  printf 'complete that flow, then return here.\n\n'
+  "${codex_bin}" login --device-auth
+
+  login_status="$("${codex_bin}" login status 2>&1 || true)"
+  printf '%s\n' "${login_status}"
+  grep -qi 'logged in using chatgpt' <<<"${login_status}" ||
+    die "chatgpt authentication did not complete"
+fi
 
 current_user="$(id -un)"
 linger="$(loginctl show-user "${current_user}" -p Linger --value 2>/dev/null || true)"
