@@ -60,13 +60,13 @@ https access—not manual deletion of codex state files.
 ## claude
 
 the installer prepares desktop-over-ssh access, completes claude.ai login when
-needed, then starts claude code remote control. the login flow displays any
-one-time code directly in the terminal. remote control then displays a session
-url; press space to show its qr code for the claude mobile app.
+needed, then runs claude code remote control as a systemd user service. the
+login flow displays any one-time code directly in the terminal, and the
+installer prints the remote session url after starting the service.
 
-remote control runs locally and connects outward over https. keep the
-`claude remote-control` process running while using it from claude.ai/code or
-the mobile app.
+remote control runs locally and connects outward over https. systemd keeps it
+running inside a detached tmux session after ssh disconnects, restarts it after
+crashes or long network outages, and starts it again after a server reboot.
 
 the usual culprit is `MaxSessions 2` in a hardened sshd config: the first
 couple of channels (probe, version check) fit, the one that launches the
@@ -75,6 +75,8 @@ server is refused.
 ### requirements
 
 - linux (amd64/arm64) with an openssh server
+- systemd user services
+- tmux
 - `sudo` access for sshd checks and fixes
 - claude code v2.1.51 or later
 - a claude.ai subscription login; api-key authentication is not supported
@@ -95,9 +97,10 @@ the guided finish will:
 
 1. run `claude auth login --claudeai` when needed, leaving the login url and
    one-time code visible in your terminal
-2. ask whether to start remote control
-3. run `claude remote-control`, which displays the session url
-4. let you press space to display the qr code for your phone
+2. enable user services at boot with lingering
+3. install and start `claude-remote-control.service`, supervising a detached
+   tmux session
+4. print the direct claude.ai session url
 
 run it from the project directory you want to expose, or specify one:
 
@@ -129,7 +132,32 @@ the script:
   and rolls everything back automatically if validation or reload fails
 - checks the remote-control cli version and incompatible auth/provider vars
 - guides claude.ai login without capturing the one-time code
-- launches server mode and leaves the session url and qr code visible
+- runs server mode in tmux under a restartable systemd user service
+- extracts and prints the session url from the detached terminal
+
+### manage
+
+```bash
+systemctl --user status claude-remote-control.service
+systemctl --user restart claude-remote-control.service
+systemctl --user stop claude-remote-control.service
+tmux -L hands-off-claude-remote-control attach -t remote-control
+journalctl --user -u claude-remote-control.service -f
+```
+
+the tmux session is the background terminal. attach to it and press space for a
+qr code; detach without stopping claude with `ctrl-b d`. you can also open the
+printed url directly or select the online session in claude.ai/code or mobile.
+use the systemd stop command above when you intentionally want it to stay off.
+
+if the service cannot start because the project is not trusted, open it once
+interactively, accept the trust prompt, exit claude, and restart the service:
+
+```bash
+cd /path/to/project
+claude
+systemctl --user restart claude-remote-control.service
+```
 
 ### troubleshoot
 
