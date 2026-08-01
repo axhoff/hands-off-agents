@@ -622,7 +622,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-WorkingDirectory="${escaped_project_dir}"
+WorkingDirectory=${escaped_project_dir}
 ExecStart="${escaped_supervisor_file}" "${escaped_tmux_bin}" "${tmux_socket_name}" "${tmux_session_name}" "${escaped_claude_bin}" ${claude_args}
 Restart=always
 RestartSec=10
